@@ -1,0 +1,377 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r, include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(lme4)
+library(sjPlot)
+library(ggfortify)
+library(svglite)
+library(ggeffects)
+library(saemix)
+library(ggpubr)
+```
+
+```{r}
+results_2 <- results_study2 <- read.csv("results/results_for_study2.csv")
+families <- c("Providence_Alex",
+              "Providence_William",
+              "Providence_Ethan",
+              "Providence_Violet",
+              "Providence_Lily",
+              "Providence_Naima")
+plt_results2 <- ggplot(filter(results_2,
+              # phonemes_order_noise == 0 &
+              phonemes_noise == 0 &
+              # speakers_noise_adult == 0 &
+              # speakers_noise_child == 0 & 
+              family %in% families &
+              age > 0 & age <= 60)) + 
+    aes(x=age, y=entropy, color=speaker) +
+    geom_point(aes(x = age, y = entropy),
+               size = 0.5) +
+    stat_cor(method="spearman", 
+             aes(color = speaker, label = paste(..r.label.., sep = "~,~")),
+             size=6,
+             label.y.npc = "top",
+             label.x.npc="middle",
+             show.legend = FALSE,
+             cor.coef.name = "rho") +
+    facet_wrap(phonemes_order_noise ~ .) +
+    guides(color=guide_legend(override.aes=list(fill=NA))) +  
+    theme_bw(base_size = 9) +
+    theme(legend.position="bottom", 
+          legend.title = element_blank(),
+          text = element_text(size = 30)) +
+    scale_color_manual(values = cbp1) +
+    ylab("Entropy") +
+    xlab("Age (months)")
+```
+
+
+```{r}
+plt_results2
+```
+
+```{r}
+ggsave(filename = "plots/plots_study1/results_for_study2_order_noises_provid.pdf", plot=plt_results2, device="pdf", dpi=720, height = 10, width = 12)
+```
+
+
+# Prepare data
+
+```{r}
+set.seed(8261)
+split_train_test <- function(data, percentage){
+  smp_size <- floor(percentage * nrow(data))
+  train_ind <- sample(seq_len(nrow(data)), size = smp_size)
+  return(list("train" = data[train_ind, ], "test" = data[-train_ind, ]))
+}
+
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+
+data_without_outliers <- function(data, group_name) {
+  return(
+    data <- data %>%
+    group_by({{group_name}}, rounded_ages) %>%
+    mutate(entropy = remove_outliers(entropy)) %>%
+    na.omit() %>%
+    as.data.frame()
+  )
+}
+
+prepare_data <- function(data, group_name) {
+  data_child <- data %>%
+  filter(speaker == "Target_Child", age > 0 & age < 60) 
+  data_child$rounded_ages <- round(data_child$age, 0)
+  data_child <- data_without_outliers(data_child, {{group_name}})
+  
+  data_adult <- data %>%
+  filter(speaker == "Adult", age > 0 & age < 60) 
+  data_adult$rounded_ages <- round(data_adult$age, 0)
+  data_adult <- data_without_outliers(data_adult, {{group_name}})
+  
+  
+  return(list("Adult" = split_train_test(data_adult, .80), 
+              "Target_Child" = split_train_test(data_child, .80)))
+}
+
+recode_families <- function(data) {
+  return(data %>%
+    mutate(family = recode(family,
+                           Providence_Alex = "Alex",
+                           Providence_William = "William",
+                           Providence_Ethan = "Ethan",
+                           Providence_Violet = "Violet",
+                           Providence_Lily = "Lily",
+                           Providence_Naima = "Naima")))
+}
+
+filter_age_noises <- function(data) {
+  return(data %>%
+  filter(phonemes_order_noise == 0 & # set all noises to 0.
+              phonemes_noise == 0 &
+              speakers_noise_adult == 0 &
+              speakers_noise_child == 0 &
+              age > 0 & age <= 60))
+  }
+```
+
+
+# The model
+
+```{r}
+logistic.model_raw <- function(psi, id, xidep) {
+  age <- xidep[, 1]
+  # upper_asymptote <- psi[id, 1]
+  slope <- psi[id, 1]
+  lower_asymptote <- psi[id, 2]
+  inflection <- psi[id, 3]
+  y_hat <- lower_asymptote / (1 + slope * exp(-inflection * age))   # autre écriture possible et qui donne les mêmes résultats : lower_asymptote / (1 + slope * exp(-inflection * age)) mais a du mal à bien estimer les paramètres
+  return(y_hat)
+}
+
+logistic.model <- function(psi, id, xidep) {
+  age <- xidep[, 1]
+  upper_asymptote <- psi[id, 1]
+  slope <- psi[id, 2]
+  lower_asymptote <- psi[id, 3]
+  inflection <- psi[id, 4]
+  y_hat <- upper_asymptote + (lower_asymptote - upper_asymptote) / (1 + slope * exp(-inflection * age)) # (1 + exp(slope * (age - inflection))) donne les mêmes résultats
+  return(y_hat)
+}
+
+logistic.model1 <- saemixModel(model = logistic.model_raw,
+                              description = "Logistic decay",
+                              psi0 = matrix(c(-.01, 2, 10),
+                                            ncol = 3, byrow = TRUE,
+                                            dimnames = list(NULL, 
+                                                            c("slope", "lower_asymptote", "inflection"))))
+
+logistic.model2 <- saemixModel(model = logistic.model,
+                              description = "Logistic decay",
+                              psi0 = matrix(c(3, -.1, 2, 10),
+                                            ncol = 4, byrow = TRUE,
+                                            dimnames = list(NULL, 
+                                                            c("upper_asymptote", "slope", "lower_asymptote", "inflection"))))
+```
+
+## Make saemix data
+
+
+```{r}
+get_saemix_data <- function(data, group_name) {
+  return(
+    saemixData(name.data = data,
+               name.group = group_name,
+               name.predictors = "age",
+               name.response = "entropy",
+               units = list(x = "en mois"))
+  )
+}
+```
+
+## fitting function
+
+```{r}
+fit.model <- function(model, data, group_name) {
+  saemix.options<-list(seed = 94352514, save = FALSE, save.graphs = FALSE)
+  return(saemix(model, get_saemix_data(data, group_name), saemix.options))
+}
+```
+
+# plots
+
+```{r}
+plot_fitted_model <- function(data_for_child, 
+                              data_for_adult, 
+                              fitted_model_child, 
+                              fitted_model_adult) {
+  cbp1 <- c("#000000", "#D55E00", "#CC79A7")
+  ### children
+  reordered_data_for_child <- data_for_child[with(data_for_child, order(family, age)),]
+  reordered_data_for_child$predicted <- fitted_model_child@results@ipred
+  reordered_data_for_child$ci <- quantile(fitted_model_child@results@ires, 1 - .05)
+  reordered_data_for_child$ppredicted <- fitted_model_child@results@ppred
+  ### adults
+  reordered_data_for_adult <- data_for_adult[with(data_for_adult, order(family, age)),]
+  reordered_data_for_adult$predicted <- fitted_model_adult@results@ipred
+  reordered_data_for_adult$ci <- quantile(fitted_model_adult@results@ires, 1 - .05)
+  reordered_data_for_adult$ppredicted <- fitted_model_adult@results@ppred
+  data <- rbind(reordered_data_for_child, reordered_data_for_adult)
+  return(
+    ggplot(data) + 
+      aes(color=speaker, y = entropy, x = age) +
+      geom_point(aes(x = age, y = entropy),
+                 size = .3) +
+      geom_line(aes(x = age, y = predicted, linetype='Individu'), size=.9) +
+      # geom_ribbon(aes(x = age, 
+                      # y = entropy,
+                      # ymin = predicted - ci,
+                      # ymax = predicted + ci),    # shadowing cnf intervals
+                # alpha=.06,
+                # size=0.0) + 
+      geom_line(aes(x = age, y = ppredicted, linetype='Population'), size=.9) +
+      facet_wrap(family ~ . ) +#fct_reorder2(language, language, typology) ~ typology) +
+      theme_bw(base_size = 9) +
+      theme(legend.position="bottom", 
+            legend.title = element_blank(),
+            text = element_text(size = 15),
+            legend.key = element_blank(), 
+            legend.text = element_text(size = 15),
+            legend.key.size =  unit(0.35, "in")) +
+      scale_color_manual(values = cbp1, labels=c("Parents", "Enfant")) +
+      scale_linetype_manual(values=c('Individu'='solid','Population'="dashed")) +
+      ylab("Entropie croisée") +
+      xlab("Âge (mois)")
+      )
+  }
+```
+
+# Test
+
+```{r}
+evaluate <- function(test_data, estimated_model)  {
+  model_preds <- saemixPredictNewdata(estimated_model, test_data)
+  random_preds <- sample(c(runif(nrow(test_data), min(test_data$entropy), max(test_data$entropy))))
+  
+  message(paste("RMSE model:", sqrt(mean((test_data$entropy - model_preds$predictions$ipred)^2))))
+  message(paste("RMSE random:", sqrt(mean((test_data$entropy - random_preds)^2))))
+  message(paste("R-2 model:", mean((test_data$entropy - model_preds$predictions$ipred)^2)))
+  message(paste("R-2 random:", mean((test_data$entropy - random_preds)^2)))
+}
+```
+
+
+# Main
+
+```{r}
+results_study2 <- read.csv("results/results_for_study1_child_no_phonemized_adult.csv")
+data_ready <- prepare_data(recode_families(results_study2))
+# data_ready <- prepare_data(filter_age_noises(results_study2))
+```
+
+```{r}
+estimated_child <- fit.model(logistic.model1, data_ready$Target_Child$train, "family")
+estimated_adult <- fit.model(logistic.model1, data_ready$Adult$train, "family")
+```
+
+
+```{r}
+plot_res1 <- plot_fitted_model(data_ready$Target_Child$train,
+                               data_ready$Adult$train, 
+                               estimated_child, 
+                               estimated_adult)
+```
+
+```{r}
+plot_res1
+```
+
+```{r}
+# ggsave(filename = "plots/plots_study1/results2.pdf", plot=plot_res1, device="pdf", dpi=720, height = 6, width = 8)
+ggsave(filename = "plots/plots_study1/plot_1_1.pdf", plot=plot_res1, device="pdf", dpi=720, height = 10, width = 12)
+```
+
+
+
+
+```{r}
+evaluate(data_ready$Target_Child$test, estimated_child)
+evaluate(data_ready$Target_Child$train, estimated_child)
+```
+
+```{r}
+evaluate(data_ready$Adult$test, estimated_adult)
+evaluate(data_ready$Adult$train, estimated_adult)
+```
+
+
+
+```{r}
+estimated_child@results@fixed.psi
+```
+
+```{r}
+estimated_child@results
+```
+
+```{r}
+estimated_adult@results
+```
+
+## data
+
+```{r}
+get_saemix_data <- function(data) {
+  return(
+    saemixData(name.data = data,
+               name.group = "language",
+               name.predictors = "age",
+               name.response = "entropy",
+               units = list(x = "en mois"))
+  )
+}
+```
+
+## The model
+
+### Define the model
+
+```{r}
+logistic.model <- function(psi, id, xidep) {
+  age <- xidep[, 1]
+  slope <- psi[id, 1]
+  asymptote <- psi[id, 2]
+  inflection <- psi[id, 3]
+  y_hat <- asymptote / (1 + (slope * (inflection ** age)))
+  return(y_hat)
+}
+```
+
+### Make the model compatible with SAEMIX
+
+```{r}
+logistic.model <- saemixModel(model = logistic.model,
+                              description = "Logistic decay",
+                              psi0 = matrix(c(-.2, 2, 10),
+                                            ncol = 3, byrow = TRUE,
+                                            dimnames = list(NULL, 
+                                                            c("slope", "asymptote", "inflection"))))
+```
+## fit the models
+
+```{r}
+fit.model <- function(data) {
+  opt <- list(seed = 94352514, save = FALSE, save.graphs = FALSE)
+  return(saemix(logistic.model, get_saemix_data(data), opt))
+}
+```
+
+```{r}
+estimated_child <- fit.model(data_ready$Target_Child$train)
+estimated_adult <- fit.model(data_ready$Adult$train)
+```
+
+```{r}
+estimated_child@results
+```
+
+```{r}
+estimated_adult@results
+```
